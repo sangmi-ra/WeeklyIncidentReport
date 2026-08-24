@@ -339,6 +339,85 @@ DATA_COLS = dict(year=1, title=3, grade=4, start=9, mins=11, cust=13,
                  content=14, cause=15, div=17, charge=18, team=19)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 장애 '내용' 요약 (규칙 기반 추출 · AI 미사용)
+#   엑셀 '장애 내용'은 대부분 (1) '문자발송 정형양식'(■ 발생일시/고객사명/…/장애내용:…),
+#   (2) '1.장애요약 …' 번호 섹션형, (3) 자유 서술 이다.
+#   → 핵심 필드('장애내용'/'요약')를 추출하거나, 없으면 앞 문장을 취해 표에 넣기 좋게 축약.
+#   시간대별 사건 로그(타임라인)형은 규칙으로 압축이 어려워 '저신뢰'로 표시(수동 검토 유도).
+#   ※ 외부 AI 호출 없음 — 사내/고객 정보가 외부로 나가지 않음.
+# ─────────────────────────────────────────────────────────────────────────────
+_SUMM_LABELS = (r'발생일시|일시|발생일|복구|고객사명|고객사|시스템명|장애\s*발생\s*시스템|장비|'
+                r'장애\s*유형|장애유형|비즈영향도|영향도|추정등급|등급|발신자|발송조직|팀장명|'
+                r'장애\s*내용|장애내용|내용|조치\s*내용|조치내용|조치사항|조치|장애\s*원인|원인|'
+                r'현상|영향|재발\s*방지|비고|특이사항|대상|경위')
+
+
+def _summ_clean(s):
+    s = s.replace('\r', '\n').replace('_x000B_', '\n')
+    s = re.sub(r'https?://\S+|www\.\S+', ' ', s)      # URL 제거
+    s = re.sub(r'[■▶◆●□▪]', '\n', s)                  # 불릿 → 줄바꿈(필드 경계)
+    s = re.sub(r'[ \t]+', ' ', s)
+    s = re.sub(r'\n{2,}', '\n', s)
+    return s.strip()
+
+
+def _summ_field(s, name):
+    """'name : 값' 필드에서 값을 추출(다음 필드 라벨 직전까지)."""
+    m = re.search(r'(?:^|\n)\s*' + name + r'\s*[:：]\s*(.+?)'
+                  r'(?=\n\s*(?:' + _SUMM_LABELS + r')\s*[:：]|\Z)', s, re.S)
+    return re.sub(r'\s+', ' ', m.group(1)).strip(' -·•*:') if m else None
+
+
+def _summ_sentences(s):
+    s = s.replace('\n', ' ')
+    parts = re.split(r'(?<=[다함음됨임])\.\s|(?<=[.!?。])\s', s)
+    return [p.strip(' ·-•*:') for p in parts if p.strip(' ·-•*:')]
+
+
+def _summ_trim(t, n=140):
+    t = re.sub(r'\s+', ' ', t).strip(' -·•*:').rstrip(' .,')
+    if len(t) <= n:
+        return t
+    cut = t[:n]
+    b = max(cut.rfind('. '), cut.rfind(', '), cut.rfind(' '))
+    return (cut[:b] if b > 70 else cut).rstrip(' ,.') + '…'
+
+
+def summarize_content(raw):
+    """엑셀 '장애 내용' → 표에 넣을 요약. 반환: (요약문, 저신뢰여부)."""
+    raw = (raw or '').strip()
+    if len(raw) < 80:                       # 이미 짧으면 그대로 사용
+        return raw, False
+    s = _summ_clean(raw)
+    # 1) '장애내용' 필드 우선(+짧으면 '조치' 결합)
+    content = _summ_field(s, r'장애\s*내용') or _summ_field(s, r'내용')
+    if content:
+        act = (_summ_field(s, r'조치\s*내용') or _summ_field(s, r'조치사항')
+               or _summ_field(s, r'조치'))
+        out = content
+        if act and len(out) < 90 and act not in out:
+            out = f"{out} (조치: {act})"
+        return _summ_trim(out), False
+    # 2) '장애요약' 섹션
+    m = re.search(r'(?:\d+\s*[.)]\s*)?(장애\s*요약|요약)\s*[:\-)]?\s*', s)
+    if m:
+        start = m.end()
+        nxt = re.search(r'\n\s*(?:\d+\s*[.)]\s*)|\n\s*(?:' + _SUMM_LABELS + r')\s*[:：]',
+                        s[start:])
+        blk = (s[start:start + nxt.start()] if nxt else s[start:])
+        blk = re.sub(r'대상\s*도메인.*', '', blk, flags=re.S).strip(' \n:-)')
+        if blk:
+            return _summ_trim(blk), False
+    # 3) 폴백: 앞 1~2문장 (시간대 로그=타임라인형이면 '저신뢰'로 표시)
+    ss = _summ_sentences(s)
+    out = ss[0] if ss else s
+    if ss and len(out) < 30 and len(ss) > 1:
+        out = out + ' ' + ss[1]
+    low_conf = len(re.findall(r'\d{1,2}:\d{2}', s)) >= 2
+    return _summ_trim(out), low_conf
+
+
 def _norm_date(s):
     """'M/D' 또는 datetime -> (월, 일)"""
     if isinstance(s, dt.datetime):
@@ -526,15 +605,18 @@ def _clear_data_rows(table):
         tbl.remove(tr)
 
 
-def rebuild_detail_list(prs, new_items):
+def rebuild_detail_list(prs, new_items, confirmed=None):
     """6p~ '장애 목록 상세'에 신규확정 누락건을 추가하고 (등급 asc, 발생일 asc)로 재정렬·재배치.
-    한 페이지 용량을 넘으면 상세 페이지를 복제해 추가한다. 추가된 건수 반환."""
+    한 페이지 용량을 넘으면 상세 페이지를 복제해 추가한다. 추가된 건수 반환.
+    confirmed(이번주 엑셀 등급확정 목록)가 주어지면, 엑셀에서 사라진(등급확정 해제/삭제) 기존 행은
+    상세목록에서 제거한다(프루닝)."""
     dinfo = _detail_slide_tables(prs)
     if not dinfo:
         return 0
     entries = []      # [grade, (m,d), tr_element]
     existing = []     # (date, cust, name)
     src_by_grade = {}
+    pruned = []       # 엑셀에서 사라져 제거한 기존 행 [(name, date)]
     page_orig = []    # 원본 각 페이지 데이터 높이 추정 → 안전 용량 산정
     for slide, tsh in dinfo:
         t = tsh.table
@@ -545,13 +627,23 @@ def rebuild_detail_list(prs, new_items):
             name = cells[0].text.strip()
             if not name:
                 continue
-            g = _grade_of(name)
             d = _norm_date(cells[1].text)
+            cust = cells[3].text.strip()
+            # 엑셀 등급확정 목록에 없는 기존 행은 제거(등급확정 해제/삭제된 건)
+            if confirmed is not None and not any(
+                    _same_incident(d, cust, name, cr) for cr in confirmed):
+                pruned.append((name, cells[1].text.strip()))
+                continue
+            g = _grade_of(name)
             entries.append([g, d, copy.deepcopy(trs[ri])])
-            existing.append((d, cells[3].text.strip(), name))
+            existing.append((d, cust, name))
             src_by_grade.setdefault(g, trs[ri])
             ph += _tr_est_height(trs[ri])
         page_orig.append(ph)
+    if pruned:
+        log(f"  [슬라이드6~9] 엑셀에서 사라진(등급확정 해제) {len(pruned)}건을 상세목록에서 제거:")
+        for nm, dt_ in pruned:
+            log(f"       − {nm} ({dt_})")
     added = 0
     for it in new_items:
         d = _norm_date(it["date"])
@@ -802,8 +894,9 @@ def normalize_table_borders(prs):
                         _set_line(lnB, THIN, light=True)
 
 
-def fill_new_confirmed(out_prs, prev_prs, ws, base_date):
-    """슬라이드 4 '신규 등급 확정 장애' 표를 채운다. 작성된 항목 리스트 반환."""
+def fill_new_confirmed(out_prs, prev_prs, ws, base_date, do_summary=True):
+    """슬라이드 4 '신규 등급 확정 장애' 표를 채운다. 작성된 항목 리스트 반환.
+    do_summary=True 이면 엑셀 '장애 내용'을 규칙 기반으로 요약해 표에 넣는다."""
     C = DATA_COLS
     detail = []
     for t in _find_tables_by_title(prev_prs, "장애 목록 상세"):
@@ -836,17 +929,23 @@ def fill_new_confirmed(out_prs, prev_prs, ws, base_date):
         # 지난주 상세목록(6p~)에 이미 있으면 신규 아님
         if any(_same_incident(d, cust, title, r) for r in detail):
             continue
-        # 장애내용: 지난주 PPT(신규발생→협의중)에서 찾은 값과 엑셀 N열 값을 비교해 '더 긴' 쪽 사용
+        # 장애내용 결정:
+        #   원문 길이로 '지난주 PPT 텍스트 vs 엑셀 N열' 중 더 정보량 많은 쪽을 고르되,
+        #   엑셀 쪽을 쓸 때는 규칙 기반 요약본을 넣는다(do_summary=True).
         prev_content, prev_src = lookup(sinbal), "지난주 신규발생"
         if prev_content is None:
             prev_content, prev_src = lookup(hyeobui), "지난주 협의중"
-        excel_content = str(ws.cell(ri, C["content"]).value or "").strip()
-        if prev_content is None:
-            content, src = excel_content, "엑셀 데이터"
-        elif len((prev_content or "").strip()) >= len(excel_content):
-            content, src = prev_content, f"{prev_src}(더 김 {len(prev_content.strip())}자)"
+        excel_raw = str(ws.cell(ri, C["content"]).value or "").strip()
+        excel_sum, low_conf = (summarize_content(excel_raw) if do_summary
+                               else (excel_raw, False))
+        use_excel = prev_content is None or len((prev_content or "").strip()) < len(excel_raw)
+        if use_excel:
+            content = excel_sum
+            src = "엑셀(요약)" if (do_summary and len(excel_raw) >= 80) else "엑셀 데이터"
+            if do_summary and low_conf and len(excel_raw) >= 80:
+                src += " ⚠️저신뢰(수동검토)"
         else:
-            content, src = excel_content, f"엑셀 데이터(더 김 {len(excel_content)}자)"
+            content, src = prev_content, f"{prev_src}(유지)"
         new_items.append({
             "name": f"[{grade}] {title}", "date": f"{d[0]}/{d[1]}",
             "mins": ws.cell(ri, C["mins"]).value, "cust": cust, "content": content,
@@ -860,7 +959,7 @@ def fill_new_confirmed(out_prs, prev_prs, ws, base_date):
     tabs = _find_tables_by_title(out_prs, "신규 등급 확정 장애")
     if not tabs:
         log("  [경고] '신규 등급 확정 장애' 표를 찾지 못했습니다.")
-        return new_items
+        return new_items, confirmed
     table = tabs[0]
     _set_table_data_rows(table, max(len(new_items), 1))
     if new_items:
@@ -907,7 +1006,7 @@ def fill_new_confirmed(out_prs, prev_prs, ws, base_date):
                     if sh.top is not None and sh.top >= base - 1000:
                         sh.top = sh.top + delta
                 log(f"  [슬라이드4] '신규 발생 장애' 섹션 {delta/914400:.2f}in 아래로 이동(겹침 방지)")
-    return new_items
+    return new_items, confirmed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -922,9 +1021,14 @@ def parse_args():
                    help="PPT 템플릿 경로(미지정 시 --prev 를 템플릿으로 사용)")
     p.add_argument("--prev", required=True,
                    help="지난주 장애공유 PPT 경로 (템플릿 겸 비교용, 필수)")
-    p.add_argument("--date", default=None, help="기준일 (YYYY-MM-DD, 기본: 오늘)")
+    p.add_argument("--date", default=None,
+                   help="기준일 (YYYY-MM-DD). 기본: 엑셀 기준일(요약!B2), 없으면 오늘")
+    p.add_argument("--date-source", choices=("auto", "excel", "input"), default="auto",
+                   help="기준일 우선순위: auto(엑셀 우선)·excel(무조건 엑셀)·input(무조건 --date)")
     p.add_argument("--out", default=None, help="결과 PPT 경로(미지정 시 지난주 PPT 폴더에 생성)")
     p.add_argument("--outdir", default=None, help="결과 폴더(미지정 시 지난주 PPT 폴더)")
+    p.add_argument("--raw-content", action="store_true",
+                   help="엑셀 '장애 내용'을 요약하지 않고 원문 그대로 넣음(기본: 규칙 기반 요약)")
     return p.parse_args()
 
 
@@ -940,22 +1044,61 @@ def resolve_xlsx(args, base_date, here):
     return max(files, key=os.path.getmtime) if files else None
 
 
+def read_basedate(xlsx):
+    """엑셀 '요약' 시트의 기준일(B2, 없으면 B1)을 date-only datetime으로 반환. 없으면 None.
+    (런처가 in-process로 호출해 화면 날짜 자동 채움/불일치 확인에 사용)"""
+    wb = None
+    try:
+        wb = openpyxl.load_workbook(xlsx, data_only=True, read_only=True)
+        ws = wb["요약"]
+        for addr in ("B2", "B1"):
+            v = ws[addr].value
+            if isinstance(v, dt.datetime):
+                return dt.datetime(v.year, v.month, v.day)
+    except Exception:
+        return None
+    finally:
+        if wb is not None:
+            try:
+                wb.close()
+            except Exception:
+                pass
+    return None
+
+
 def main():
     args = parse_args()
     here = os.path.dirname(os.path.abspath(__file__))
 
-    if args.date:
-        base_date = dt.datetime.strptime(args.date, "%Y-%m-%d")
-    else:
-        t = dt.date.today()
-        base_date = dt.datetime(t.year, t.month, t.day)
-    by, bm = base_date.year, base_date.month
+    input_date = dt.datetime.strptime(args.date, "%Y-%m-%d") if args.date else None
 
-    xlsx = resolve_xlsx(args, base_date, here)
+    xlsx = resolve_xlsx(args, input_date, here)
     if not xlsx or not os.path.exists(xlsx):
         log("[오류] 업데이트된 엑셀을 찾을 수 없습니다.")
         log("       먼저 update_excel.py 를 실행하거나 --xlsx 로 경로를 지정하세요.")
         sys.exit(1)
+
+    # 리포트 기준일 결정: 원칙은 '엑셀 기준일'(차트·건수가 엑셀에서 나오므로 제목도 데이터와 일치).
+    #   --date-source: auto(엑셀 우선) / excel(무조건 엑셀) / input(무조건 --date)
+    excel_date = read_basedate(xlsx)
+    today = dt.date.today()
+    if args.date_source == "input" and input_date:
+        base_date = input_date
+    elif args.date_source == "excel" and excel_date:
+        base_date = excel_date
+    else:  # auto
+        base_date = excel_date or input_date or dt.datetime(today.year, today.month, today.day)
+    by, bm = base_date.year, base_date.month
+
+    if excel_date and input_date and excel_date.date() != input_date.date():
+        if base_date.date() == excel_date.date():
+            log(f"  [알림] 입력 기준일({input_date:%Y-%m-%d}) != 엑셀 기준일({excel_date:%Y-%m-%d})"
+                f" -> 데이터와 일치하도록 엑셀 기준일 사용. (입력값 강제: --date-source input)")
+        else:
+            log(f"  [경고] 입력 기준일({input_date:%Y-%m-%d}) 사용 — 엑셀 데이터는"
+                f" {excel_date:%Y-%m-%d} 기준이라 제목과 실제 데이터 날짜가 다릅니다.")
+    elif not excel_date:
+        log("  [알림] 엑셀 기준일(요약!B2)을 읽지 못해 입력/오늘 날짜를 사용합니다.")
     if not os.path.exists(args.prev):
         log(f"[오류] 지난주 PPT를 찾을 수 없습니다: {args.prev}")
         sys.exit(1)
@@ -1077,27 +1220,39 @@ def main():
     m_tot = re.search(r"총\s*([\d,]+)\s*건", c22)
     m_g2 = re.search(r"2등급\s*([\d,]+)\s*건", c22)
     m_g3 = re.search(r"3등급\s*이하\s*([\d,]+)\s*건", c22)
+    detail_count_text = None    # 상세목록 제목 건수 (rebuild 이후 모든 상세 슬라이드에 적용)
     if m_tot and m_g2 and m_g3:
         tot = m_tot.group(1); g2 = m_g2.group(1); g3 = m_g3.group(1)
-        count_text = group_commas(f"(2등급 {g2}건, 3등급 이하 {g3}건 총 {tot}건)")
-        for si in (6, 7, 8, 9):
-            for sh in prs.slides[si].shapes:
-                if sh.has_text_frame and "장애 목록 상세" in sh.text_frame.text:
-                    set_detail_title(sh, count_text)
-        log(f"  [슬라이드6~9] 제목 등급건수 갱신(14pt): 장애 목록 상세 {count_text}")
+        detail_count_text = group_commas(f"(2등급 {g2}건, 3등급 이하 {g3}건 총 {tot}건)")
     else:
         log("  [경고] 요약!C22에서 등급 건수를 추출하지 못해 제목을 갱신하지 않음")
 
     # ── 슬라이드 4: 신규 등급 확정 장애 (지난주 PPT 비교) ──
     prev_prs = Presentation(args.prev)
-    new_items = fill_new_confirmed(prs, prev_prs, wb["데이터"], base_date)
-    log(f"  [슬라이드4] 신규 등급 확정 장애 {len(new_items)}건 작성 (지난주: {os.path.basename(args.prev)})")
+    new_items, confirmed = fill_new_confirmed(prs, prev_prs, wb["데이터"], base_date,
+                                              do_summary=not args.raw_content)
+    log(f"  [슬라이드4] 신규 등급 확정 장애 {len(new_items)}건 작성 (지난주: {os.path.basename(args.prev)})"
+        + ("  [내용요약: ON]" if not args.raw_content else "  [내용요약: OFF(원문)]"))
     for it in new_items:
         log(f"     - {it['name']}  (발생 {it['date']}, 내용출처: {it['src']})")
+    low = [it for it in new_items if "저신뢰" in it["src"]]
+    if low:
+        log(f"  [내용요약] ⚠️ 규칙 신뢰도 낮음 {len(low)}건 — PPT 생성 후 아래 항목의 '장애내용' 칸을 눈으로 확인하세요:")
+        for it in low:
+            log(f"       · {it['name']} (발생 {it['date']})")
 
-    # ── 슬라이드 6~9: '장애 목록 상세'에 신규확정 누락건 추가 + (등급→발생일) 재정렬 ──
-    added = rebuild_detail_list(prs, new_items)
+    # ── 슬라이드 6~9: '장애 목록 상세'에 신규확정 누락건 추가 + 엑셀 삭제건 제거 + (등급→발생일) 재정렬 ──
+    added = rebuild_detail_list(prs, new_items, confirmed)
     log(f"  [슬라이드6~9] 장애 목록 상세 재정렬 완료 (신규확정 {added}건 추가)")
+
+    # 상세목록 제목 등급건수를 '모든' 상세 슬라이드에 적용(페이지 추가/삭제 후 실행 → 인덱스 하드코딩 안 함)
+    if detail_count_text:
+        n = 0
+        for slide in prs.slides:
+            for sh in slide.shapes:
+                if sh.has_text_frame and "장애 목록 상세" in sh.text_frame.text:
+                    set_detail_title(sh, detail_count_text); n += 1
+        log(f"  [슬라이드6~] 제목 등급건수 갱신(14pt) {n}개: 장애 목록 상세 {detail_count_text}")
 
     # 모든 표의 내부 행 구분선을 가늘고 연하게 통일 (행 추가/삭제로 생긴 두꺼운 선 정리)
     normalize_table_borders(prs)

@@ -43,6 +43,9 @@ DEFAULTS = {
 }
 
 _run_lock = threading.Lock()   # 중복 실행 방지
+_last_ping = time.time()       # 웹 페이지 heartbeat 마지막 수신 시각
+_bye_at = 0.0                  # 탭 닫힘(pagehide) 신호 수신 시각
+_HEARTBEAT_TIMEOUT = 90        # 이 시간(초) 동안 ping 이 없으면(백그라운드 등) 안전망 종료
 
 PAGE = r"""<!DOCTYPE html>
 <html lang="ko"><head><meta charset="utf-8"><title>장애 주간보고 생성기</title>
@@ -88,6 +91,7 @@ PAGE = r"""<!DOCTYPE html>
   <div class="card">
     <label>기준일</label>
     <div class="row"><input type="date" id="date"></div>
+    <div class="hint" id="xlnote"></div>
 
     <label>원본 엑셀 (데이터 시트) — 갱신 시 같은 폴더에 '_날짜' 백업 후 원본을 덮어씁니다</label>
     <div class="row"><input type="text" id="src"><button class="browse" onclick="browse('src','file','excel')">찾아보기</button></div>
@@ -112,27 +116,52 @@ PAGE = r"""<!DOCTYPE html>
 
 <script>
 const $=id=>document.getElementById(id);
+let lastExcelDate='';
 async function loadDefaults(){
   const d=await (await fetch('/defaults')).json();
   for(const k of ['date','src','prev']) $(k).value=d[k]||'';
+  refreshExcelDate();
+}
+async function refreshExcelDate(){
+  // 엑셀 기준일은 '표시/비교용'으로만 읽는다. 날짜 입력칸은 오늘 날짜 기본을 유지(덮어쓰지 않음).
+  const src=$('src').value;
+  if(!src){ lastExcelDate=''; $('xlnote').textContent=''; return; }
+  try{
+    const r=await (await fetch('/exceldate?src='+encodeURIComponent(src))).json();
+    lastExcelDate=r.date||'';
+    $('xlnote').textContent = lastExcelDate ? ('현재 엑셀 기준일: '+lastExcelDate) : '';
+  }catch(e){ lastExcelDate=''; $('xlnote').textContent=''; }
 }
 async function browse(target,kind,flt){
   const cur=encodeURIComponent($(target).value||'');
   try{
     const r=await (await fetch(`/browse?kind=${kind}&flt=${flt}&cur=${cur}`)).json();
-    if(r.path) $(target).value=r.path;
+    if(r.path){
+      $(target).value=r.path;
+      $(target).dispatchEvent(new Event('input',{bubbles:true}));  // 리페인트 유도
+      try{ window.focus(); }catch(e){}
+      if(target==='src') refreshExcelDate();
+    }
   }catch(e){ alert('파일 선택 창을 열 수 없습니다. 경로를 직접 입력하세요.'); }
 }
 function setBusy(b){ for(const id of ['btnExcel','btnPpt','btnBoth']) $(id).disabled=b; }
 let es=null;
 function run(mode){
+  // PPT만 생성인데 화면 기준일이 엑셀 기준일과 다르면: 엑셀을 먼저 그 날짜로 갱신할지 물어봄
+  if(mode==='ppt' && lastExcelDate && $('date').value && $('date').value!==lastExcelDate){
+    const ok=confirm('선택한 기준일('+$('date').value+')로 엑셀을 먼저 업데이트한 뒤 PPT를 생성할까요?\n\n'
+      +'[확인] 엑셀 업데이트('+$('date').value+') → PPT 생성\n'
+      +'[취소] 엑셀 기준일('+lastExcelDate+') 그대로 PPT만 생성');
+    if(ok){ mode='both'; }
+    else { alert('엑셀 기준일('+lastExcelDate+')에 맞춰 PPT를 생성합니다.'); $('date').value=lastExcelDate; }
+  }
   const p=new URLSearchParams({mode,date:$('date').value,src:$('src').value,prev:$('prev').value});
   $('log').innerHTML=''; $('results').innerHTML=''; setBusy(true); $('status').textContent='실행 중…';
   es=new EventSource('/run?'+p.toString());
   es.onmessage=e=>addLog(e.data);
   es.addEventListener('done',e=>{
     const r=JSON.parse(e.data); es.close(); setBusy(false);
-    if(r.status==='ok'){ $('status').innerHTML='✅ 완료되었습니다.';
+    if(r.status==='ok'){ $('status').innerHTML='✅ 완료되었습니다.'; refreshExcelDate();
       const res=$('results'); res.innerHTML='';
       if(r.excel) res.appendChild(link('📗 엑셀 열기',r.excel));
       if(r.ppt) res.appendChild(link('📕 PPT 열기',r.ppt));
@@ -153,18 +182,92 @@ function link(text,path){ const a=document.createElement('a'); a.textContent=tex
   a.onclick=()=>fetch('/open?path='+encodeURIComponent(path)); return a; }
 function quitApp(){ if(confirm('런처를 종료할까요?')){ fetch('/quit');
   document.body.innerHTML='<div class="wrap"><h1>종료되었습니다.</h1><p class="desc">이 탭을 닫으셔도 됩니다.</p></div>'; } }
+// heartbeat: 탭이 열려있는 동안 주기적으로 ping. 탭을 닫으면 pagehide로 /bye → 런처가 곧 종료.
+// (새로고침 시엔 재접속하며 ping 이 와서 종료 취소됨)
+fetch('/ping').catch(()=>{});
+setInterval(()=>{ fetch('/ping').catch(()=>{}); }, 5000);
+window.addEventListener('pagehide',()=>{ try{ fetch('/bye',{keepalive:true}); }catch(e){} });
 loadDefaults();
 </script>
 </body></html>"""
 
 
+def _ctypes_open_file(flt, initial_dir):
+    """Windows '열기' 대화상자를 Python 내장 ctypes(comdlg32.GetOpenFileNameW)로 직접 호출.
+    별도 프로세스/Add-Type 없이 in-process 로 떠서 매우 빠르다. 실패 시 예외 → 호출부에서 PS 폴백.
+    hwndOwner 를 현재 포그라운드(=브라우저)로 주어 대화상자가 앞에 뜨고, 닫힐 때 포커스가 브라우저로 복귀."""
+    import ctypes
+    from ctypes import wintypes
+    u32 = ctypes.windll.user32
+    comdlg32 = ctypes.windll.comdlg32
+    u32.GetForegroundWindow.restype = wintypes.HWND
+    comdlg32.GetOpenFileNameW.restype = wintypes.BOOL
+
+    filters = {
+        "excel": "Excel 파일\0*.xlsx;*.xlsm\0모든 파일\0*.*\0\0",
+        "pptx": "PowerPoint\0*.pptx;*.potx\0모든 파일\0*.*\0\0",
+    }
+    filt = filters.get(flt, "모든 파일\0*.*\0\0")
+
+    class OFN(ctypes.Structure):
+        _fields_ = [
+            ("lStructSize", wintypes.DWORD), ("hwndOwner", wintypes.HWND),
+            ("hInstance", wintypes.HINSTANCE), ("lpstrFilter", wintypes.LPCWSTR),
+            ("lpstrCustomFilter", wintypes.LPWSTR), ("nMaxCustFilter", wintypes.DWORD),
+            ("nFilterIndex", wintypes.DWORD), ("lpstrFile", wintypes.LPWSTR),
+            ("nMaxFile", wintypes.DWORD), ("lpstrFileTitle", wintypes.LPWSTR),
+            ("nMaxFileTitle", wintypes.DWORD), ("lpstrInitialDir", wintypes.LPCWSTR),
+            ("lpstrTitle", wintypes.LPCWSTR), ("Flags", wintypes.DWORD),
+            ("nFileOffset", wintypes.WORD), ("nFileExtension", wintypes.WORD),
+            ("lpstrDefExt", wintypes.LPCWSTR), ("lCustData", ctypes.c_void_p),
+            ("lpfnHook", ctypes.c_void_p), ("lpTemplateName", wintypes.LPCWSTR),
+            ("pvReserved", ctypes.c_void_p), ("dwReserved", wintypes.DWORD),
+            ("FlagsEx", wintypes.DWORD),
+        ]
+
+    buf = ctypes.create_unicode_buffer(2048)
+    ofn = OFN()
+    ofn.lStructSize = ctypes.sizeof(OFN)
+    try:
+        ofn.hwndOwner = u32.GetForegroundWindow()
+    except Exception:
+        pass
+    ofn.lpstrFilter = filt
+    ofn.lpstrFile = ctypes.cast(buf, wintypes.LPWSTR)
+    ofn.nMaxFile = 2048
+    if initial_dir:
+        ofn.lpstrInitialDir = initial_dir
+    ofn.Flags = 0x00080000 | 0x00001000 | 0x00000800 | 0x00000008  # EXPLORER|FILEMUSTEXIST|PATHMUSTEXIST|NOCHANGEDIR
+    ok = comdlg32.GetOpenFileNameW(ctypes.byref(ofn))
+    if ok:
+        return buf.value
+    err = comdlg32.CommDlgExtendedError()
+    if err:
+        raise OSError("GetOpenFileNameW error 0x%x" % err)
+    return ""     # 사용자 취소
+
+
 def _native_browse(kind, flt, cur):
-    """PowerShell WinForms 대화상자로 파일/폴더 선택(Windows 네이티브)."""
+    """파일/폴더 선택. 파일은 ctypes 내장 대화상자(빠름) 우선, 실패 시 PowerShell 폴백. 폴더는 PowerShell."""
     initial = cur or ""
     if initial and os.path.isfile(initial):
         initial = os.path.dirname(initial)
     if not initial or not os.path.isdir(initial):
         initial = BASE_DIR
+    if os.name == "nt" and kind != "folder":
+        try:
+            path = _ctypes_open_file(flt, initial)
+            if path == "":
+                return ""                       # 사용자 취소
+            if os.path.exists(path):
+                return path
+        except Exception:
+            pass                                # ctypes 실패 → PowerShell 폴백
+    return _ps_browse(kind, flt, initial)
+
+
+def _ps_browse(kind, flt, initial):
+    """PowerShell WinForms 대화상자(폴백/폴더용). 느리지만 확실."""
     ini = initial.replace("'", "''")
     if kind == "folder":
         body = (f"$d = New-Object System.Windows.Forms.FolderBrowserDialog\n"
@@ -188,6 +291,7 @@ def _native_browse(kind, flt, cur):
         'using System.Runtime.InteropServices;\n'
         'public class FG {\n'
         '  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);\n'
+        '  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();\n'
         '  [DllImport("user32.dll")] public static extern void keybd_event(byte b, byte s, uint f, IntPtr e);\n'
         '}\n'
         '"@\n'
@@ -197,19 +301,27 @@ def _native_browse(kind, flt, cur):
         "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n"
         "Add-Type -AssemblyName System.Windows.Forms | Out-Null\n"
         + fg +
+        "$prev = [FG]::GetForegroundWindow()\n"     # 대화상자 열기 전 포그라운드(=브라우저) 저장
         "$owner = New-Object System.Windows.Forms.Form\n"
         "$owner.TopMost = $true; $owner.ShowInTaskbar = $false; $owner.Opacity = 0\n"
         "$owner.StartPosition = 'CenterScreen'\n"
         "$owner.Show(); $owner.Activate()\n"
         "[FG]::keybd_event(0x12,0,0,[IntPtr]::Zero); [FG]::keybd_event(0x12,0,2,[IntPtr]::Zero)\n"
         "[FG]::SetForegroundWindow($owner.Handle) | Out-Null\n"
-        + body + "$owner.Close()\n"
+        + body
+        + "$owner.Close()\n"
+        # 대화상자가 가져갔던 포커스를 브라우저로 복귀 → 선택 즉시 화면 반영(리페인트)
+        "[FG]::keybd_event(0x12,0,0,[IntPtr]::Zero); [FG]::keybd_event(0x12,0,2,[IntPtr]::Zero)\n"
+        "if($prev -ne [IntPtr]::Zero){ [FG]::SetForegroundWindow($prev) | Out-Null }\n"
     )
     enc = base64.b64encode(script.encode("utf-16-le")).decode()
+    # CREATE_NO_WINDOW: 콘솔 없는(windowed) 부모에서 powershell 이 새 콘솔을 할당하지 않게 함
+    # (이게 없으면 콘솔 상속 실패로 매번 콘솔 생성 → 파일선택이 수 초씩 느려짐)
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     try:
         r = subprocess.run(["powershell", "-NoProfile", "-Sta", "-EncodedCommand", enc],
                            capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=300)
+                           errors="replace", timeout=300, creationflags=flags)
         return (r.stdout or "").strip()
     except Exception:
         return ""
@@ -251,6 +363,19 @@ def _run_stream(cmd, emit):
     return proc.returncode == 0
 
 
+def _heartbeat_watchdog():
+    """웹 페이지가 살아있는 동안 /ping 을 주기적으로 보낸다.
+    - 탭을 닫으면 pagehide 로 /bye 가 오고, 잠깐 뒤 새 ping 이 없으면 즉시 종료(새로고침은 재연결되어 생존).
+    - /bye 를 못 받아도 ping 이 오래 끊기면(백그라운드 스로틀 고려) 안전망으로 종료."""
+    while True:
+        time.sleep(2)
+        now = time.time()
+        if _bye_at and now - _bye_at > 3 and _last_ping <= _bye_at:
+            os._exit(0)          # 탭 닫힘 → 빠른 종료
+        if now - _last_ping > _HEARTBEAT_TIMEOUT:
+            os._exit(0)          # 안전망
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -274,6 +399,11 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path == "/browse":
             path = _native_browse(qs.get("kind", "file"), qs.get("flt", ""), qs.get("cur", ""))
             self._send(200, "application/json", json.dumps({"path": path}))
+        elif u.path == "/exceldate":
+            src = os.path.abspath(qs.get("src", "") or DEFAULTS["src"])
+            d = make_ppt.read_basedate(src) if os.path.exists(src) else None
+            self._send(200, "application/json",
+                       json.dumps({"date": d.strftime("%Y-%m-%d") if d else ""}))
         elif u.path == "/open":
             p = qs.get("path", "")
             try:
@@ -286,6 +416,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(500, "application/json", json.dumps({"ok": False, "err": str(e)}))
         elif u.path == "/run":
             self._run(qs)
+        elif u.path == "/ping":
+            global _last_ping, _bye_at
+            _last_ping = time.time()
+            _bye_at = 0.0          # 살아있음 → 닫힘 신호 취소(새로고침 대비)
+            self._send(200, "application/json", json.dumps({"ok": True}))
+        elif u.path == "/bye":
+            globals()["_bye_at"] = time.time()   # 탭 닫힘 신호
+            self._send(200, "application/json", json.dumps({"ok": True}))
         elif u.path == "/quit":
             self._send(200, "application/json", json.dumps({"ok": True}))
             threading.Timer(0.4, lambda: os._exit(0)).start()
@@ -352,10 +490,16 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     # 하위 작업 모드: exe/py 자신을 재실행해 update_excel / make_ppt 를 직접 수행(로그는 stdout으로 스트리밍)
     if len(sys.argv) >= 2 and sys.argv[1] == "--child":
-        # 프리징(exe) 시 stdout이 cp949로 나올 수 있어 UTF-8로 강제 → 부모가 UTF-8로 읽어 한글 정상
-        for _s in (sys.stdout, sys.stderr):
+        # windowed(--noconsole) exe에서는 sys.stdout/err 가 None → 부모가 준 PIPE(fd 1/2)에 재연결.
+        # 그 외엔 UTF-8로 강제(cp949 방지) → 부모가 UTF-8로 읽어 한글 로그 정상.
+        for _fd, _name in ((1, "stdout"), (2, "stderr")):
             try:
-                _s.reconfigure(encoding="utf-8", errors="replace")
+                _s = getattr(sys, _name, None)
+                if _s is None:
+                    setattr(sys, _name, os.fdopen(_fd, "w", encoding="utf-8",
+                                                  errors="replace", buffering=1))
+                else:
+                    _s.reconfigure(encoding="utf-8", errors="replace")
             except Exception:
                 pass
         mode = sys.argv[2] if len(sys.argv) >= 3 else ""
@@ -367,6 +511,18 @@ def main():
             sys.argv = ["make_ppt"] + rest
             make_ppt.main()
         return
+
+    # windowed(--noconsole) exe: 부모(서버) 프로세스는 stdout 이 None → print() 안전하게 무시
+    if sys.stdout is None or sys.stderr is None:
+        class _Null:
+            def write(self, *a):
+                return 0
+            def flush(self):
+                pass
+        if sys.stdout is None:
+            sys.stdout = _Null()
+        if sys.stderr is None:
+            sys.stderr = _Null()
 
     no_ui = "--no-ui" in sys.argv
     port_arg = 0
@@ -380,10 +536,14 @@ def main():
     print("=" * 60)
     print("  장애 주간보고 생성기 실행 중")
     print(f"  브라우저: {url}")
-    print("  (이 창을 닫거나 웹페이지에서 '종료'를 누르면 끝납니다)")
+    print("  (웹페이지 '종료' 또는 브라우저 탭을 닫으면 끝납니다)")
     print("=" * 60)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     if not no_ui:
+        global _last_ping
+        _last_ping = time.time()
+        # 브라우저 탭이 닫히면(ping 끊김) 스스로 종료
+        threading.Thread(target=_heartbeat_watchdog, daemon=True).start()
         time.sleep(0.4)
         try:
             webbrowser.open(url)
